@@ -1,0 +1,8 @@
+services:
+  render-svc:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - RENDER_API_KEY=${RENDER_API_KEY}
