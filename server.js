@@ -81,7 +81,7 @@ app.post('/render', (req, res) => {
     scheduleCleanup(taskId);
   }, 600_000);
 
-  proc.on('close', (code) => {
+  proc.on('exit', (code) => {
     clearTimeout(timer);
     console.log(`[${taskId}] process exited with code ${code}`);
 
