@@ -18,8 +18,32 @@ app.use((req, res, next) => {
   next();
 });
 
-const jobs = new Map();
+// Persist job state to disk so it survives container restarts
+const JOBS_DIR = path.join(os.tmpdir(), 'hf-jobs');
+fs.mkdirSync(JOBS_DIR, { recursive: true });
+
 const JOB_TTL_MS = 30 * 60 * 1000; // 30 minutes
+
+function statusPath(taskId) { return path.join(JOBS_DIR, `${taskId}.json`); }
+function videoPath(taskId)  { return path.join(JOBS_DIR, `${taskId}.mp4`); }
+
+function writeStatus(taskId, data) {
+  fs.writeFileSync(statusPath(taskId), JSON.stringify(data));
+}
+
+function readStatus(taskId) {
+  const p = statusPath(taskId);
+  if (!fs.existsSync(p)) return null;
+  try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch { return null; }
+}
+
+function scheduleCleanup(taskId) {
+  setTimeout(() => {
+    try { fs.unlinkSync(statusPath(taskId)); } catch {}
+    try { fs.unlinkSync(videoPath(taskId)); } catch {}
+    console.log(`[${taskId}] job files cleaned up`);
+  }, JOB_TTL_MS);
+}
 
 app.post('/render', (req, res) => {
   const { html, audioBase64, filename } = req.body;
@@ -37,7 +61,7 @@ app.post('/render', (req, res) => {
     fs.writeFileSync(path.join(dir, 'audio.mp3'), Buffer.from(audioBase64, 'base64'));
   }
 
-  jobs.set(taskId, { status: 'processing' });
+  writeStatus(taskId, { status: 'processing' });
   console.log(`[${taskId}] render started — dir: ${dir}`);
 
   const proc = spawn(
@@ -46,55 +70,67 @@ app.post('/render', (req, res) => {
     { cwd: dir }
   );
 
-  proc.stdout.on('data', (data) => {
-    process.stdout.write(`[${taskId}] ${data}`);
-  });
-
-  proc.stderr.on('data', (data) => {
-    process.stderr.write(`[${taskId}] ${data}`);
-  });
+  proc.stdout.on('data', (data) => process.stdout.write(`[${taskId}] ${data}`));
+  proc.stderr.on('data', (data) => process.stderr.write(`[${taskId}] ${data}`));
 
   const timer = setTimeout(() => {
-    console.error(`[${taskId}] TIMEOUT — killing process after 10 minutes`);
+    console.error(`[${taskId}] TIMEOUT — killing after 10 minutes`);
     proc.kill('SIGKILL');
-    jobs.set(taskId, { status: 'failed', error: 'Render timed out after 10 minutes' });
+    writeStatus(taskId, { status: 'failed', error: 'Render timed out after 10 minutes' });
     fs.rmSync(dir, { recursive: true, force: true });
-    setTimeout(() => jobs.delete(taskId), JOB_TTL_MS);
+    scheduleCleanup(taskId);
   }, 600_000);
 
   proc.on('close', (code) => {
     clearTimeout(timer);
     console.log(`[${taskId}] process exited with code ${code}`);
+
     if (code !== 0) {
-      jobs.set(taskId, { status: 'failed', error: `hyperframes exited with code ${code}` });
+      writeStatus(taskId, { status: 'failed', error: `hyperframes exited with code ${code}` });
     } else {
       try {
-        const videoBase64 = fs.readFileSync(outPath).toString('base64');
-        console.log(`[${taskId}] done — video size: ${Math.round(videoBase64.length * 0.75 / 1024)}KB`);
-        jobs.set(taskId, { status: 'done', videoBase64 });
-      } catch (readErr) {
-        console.error(`[${taskId}] failed to read output: ${readErr.message}`);
-        jobs.set(taskId, { status: 'failed', error: readErr.message });
+        const dest = videoPath(taskId);
+        fs.copyFileSync(outPath, dest);
+        const sizeMB = (fs.statSync(dest).size / 1024).toFixed(0);
+        console.log(`[${taskId}] done — video saved to disk: ${sizeMB}KB`);
+        writeStatus(taskId, { status: 'done' });
+      } catch (err) {
+        console.error(`[${taskId}] failed to save video: ${err.message}`);
+        writeStatus(taskId, { status: 'failed', error: err.message });
       }
     }
+
     fs.rmSync(dir, { recursive: true, force: true });
-    setTimeout(() => jobs.delete(taskId), JOB_TTL_MS);
+    scheduleCleanup(taskId);
   });
 
   proc.on('error', (err) => {
     clearTimeout(timer);
     console.error(`[${taskId}] spawn error: ${err.message}`);
-    jobs.set(taskId, { status: 'failed', error: err.message });
+    writeStatus(taskId, { status: 'failed', error: err.message });
     fs.rmSync(dir, { recursive: true, force: true });
-    setTimeout(() => jobs.delete(taskId), JOB_TTL_MS);
+    scheduleCleanup(taskId);
   });
 
   res.json({ taskId });
 });
 
 app.get('/tasks/:taskId', (req, res) => {
-  const job = jobs.get(req.params.taskId);
+  const { taskId } = req.params;
+  const job = readStatus(taskId);
+  console.log(`[${taskId}] poll → ${job ? job.status : 'not found'}`);
+
   if (!job) return res.status(404).json({ error: 'Task not found or expired' });
+
+  if (job.status === 'done') {
+    const vp = videoPath(taskId);
+    if (!fs.existsSync(vp)) {
+      return res.status(404).json({ error: 'Video file missing — job may have expired' });
+    }
+    const videoBase64 = fs.readFileSync(vp).toString('base64');
+    return res.json({ status: 'done', videoBase64 });
+  }
+
   res.json(job);
 });
 
