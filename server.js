@@ -1,7 +1,7 @@
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
-const { exec } = require('child_process');
+const { spawn } = require('child_process');
 const os = require('os');
 const crypto = require('crypto');
 
@@ -38,25 +38,56 @@ app.post('/render', (req, res) => {
   }
 
   jobs.set(taskId, { status: 'processing' });
+  console.log(`[${taskId}] render started — dir: ${dir}`);
 
-  exec(
-    `npx hyperframes render --output ${outPath} --format mp4 --fps 30`,
-    { cwd: dir, timeout: 600_000 },
-    (err) => {
-      if (err) {
-        jobs.set(taskId, { status: 'failed', error: err.message });
-      } else {
-        try {
-          const videoBase64 = fs.readFileSync(outPath).toString('base64');
-          jobs.set(taskId, { status: 'done', videoBase64 });
-        } catch (readErr) {
-          jobs.set(taskId, { status: 'failed', error: readErr.message });
-        }
-      }
-      fs.rmSync(dir, { recursive: true, force: true });
-      setTimeout(() => jobs.delete(taskId), JOB_TTL_MS);
-    }
+  const proc = spawn(
+    'npx',
+    ['hyperframes', 'render', '--output', outPath, '--format', 'mp4', '--fps', '30'],
+    { cwd: dir }
   );
+
+  proc.stdout.on('data', (data) => {
+    process.stdout.write(`[${taskId}] ${data}`);
+  });
+
+  proc.stderr.on('data', (data) => {
+    process.stderr.write(`[${taskId}] ${data}`);
+  });
+
+  const timer = setTimeout(() => {
+    console.error(`[${taskId}] TIMEOUT — killing process after 10 minutes`);
+    proc.kill('SIGKILL');
+    jobs.set(taskId, { status: 'failed', error: 'Render timed out after 10 minutes' });
+    fs.rmSync(dir, { recursive: true, force: true });
+    setTimeout(() => jobs.delete(taskId), JOB_TTL_MS);
+  }, 600_000);
+
+  proc.on('close', (code) => {
+    clearTimeout(timer);
+    console.log(`[${taskId}] process exited with code ${code}`);
+    if (code !== 0) {
+      jobs.set(taskId, { status: 'failed', error: `hyperframes exited with code ${code}` });
+    } else {
+      try {
+        const videoBase64 = fs.readFileSync(outPath).toString('base64');
+        console.log(`[${taskId}] done — video size: ${Math.round(videoBase64.length * 0.75 / 1024)}KB`);
+        jobs.set(taskId, { status: 'done', videoBase64 });
+      } catch (readErr) {
+        console.error(`[${taskId}] failed to read output: ${readErr.message}`);
+        jobs.set(taskId, { status: 'failed', error: readErr.message });
+      }
+    }
+    fs.rmSync(dir, { recursive: true, force: true });
+    setTimeout(() => jobs.delete(taskId), JOB_TTL_MS);
+  });
+
+  proc.on('error', (err) => {
+    clearTimeout(timer);
+    console.error(`[${taskId}] spawn error: ${err.message}`);
+    jobs.set(taskId, { status: 'failed', error: err.message });
+    fs.rmSync(dir, { recursive: true, force: true });
+    setTimeout(() => jobs.delete(taskId), JOB_TTL_MS);
+  });
 
   res.json({ taskId });
 });
