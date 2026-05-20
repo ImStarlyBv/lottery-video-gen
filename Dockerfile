@@ -7,7 +7,7 @@ RUN apt-get update && apt-get install -y \
     libxrandr2 libgbm1 libasound2 libcups2 \
     libpango-1.0-0 libcairo2 libatspi2.0-0 \
     && rm -rf /var/lib/apt/lists/*
-RUN npm install -g hyperframes && hyperframes build
+RUN npm install -g hyperframes && hyperframes browser ensure
 
 WORKDIR /app
 COPY package.json ./
