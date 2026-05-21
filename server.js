@@ -73,16 +73,7 @@ app.post('/render', (req, res) => {
   proc.stdout.on('data', (data) => process.stdout.write(`[${taskId}] ${data}`));
   proc.stderr.on('data', (data) => process.stderr.write(`[${taskId}] ${data}`));
 
-  const timer = setTimeout(() => {
-    console.error(`[${taskId}] TIMEOUT — killing after 10 minutes`);
-    proc.kill('SIGKILL');
-    writeStatus(taskId, { status: 'failed', error: 'Render timed out after 10 minutes' });
-    fs.rmSync(dir, { recursive: true, force: true });
-    scheduleCleanup(taskId);
-  }, 600_000);
-
   proc.on('exit', (code) => {
-    clearTimeout(timer);
     console.log(`[${taskId}] process exited with code ${code}`);
 
     if (code !== 0) {
@@ -105,7 +96,6 @@ app.post('/render', (req, res) => {
   });
 
   proc.on('error', (err) => {
-    clearTimeout(timer);
     console.error(`[${taskId}] spawn error: ${err.message}`);
     writeStatus(taskId, { status: 'failed', error: err.message });
     fs.rmSync(dir, { recursive: true, force: true });
